@@ -15,11 +15,31 @@
  */
 package org.springframework.batch.container.jms;
 
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
+
+import java.util.SortedSet;
+import java.util.TreeSet;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import javax.jms.Destination;
+import javax.jms.JMSException;
+import javax.jms.Message;
+import javax.jms.MessageListener;
+import javax.jms.TextMessage;
+
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
 import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.Before;
+import org.junit.Ignore;
 import org.junit.Test;
 import org.junit.runner.RunWith;
+
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.jms.core.JmsTemplate;
 import org.springframework.retry.RecoveryCallback;
@@ -31,32 +51,24 @@ import org.springframework.retry.support.RetryTemplate;
 import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.junit4.SpringJUnit4ClassRunner;
 
-import javax.jms.JMSException;
-import javax.jms.Message;
-import javax.jms.MessageListener;
-import javax.jms.TextMessage;
-import java.util.SortedSet;
-import java.util.TreeSet;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.TimeUnit;
-
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNotNull;
-
 /**
  * @author Dave Syer
- * 
+ *
  */
 @RunWith(SpringJUnit4ClassRunner.class)
 @ContextConfiguration(locations = "/org/springframework/batch/jms/jms-context.xml")
 public class BatchMessageListenerContainerIntegrationTests {
+
+	private static final Log logger = LogFactory.getLog(BatchMessageListenerContainerIntegrationTests.class);
 
 	@Autowired
 	private JmsTemplate jmsTemplate;
 
 	@Autowired
 	private BatchMessageListenerContainer container;
+
+	@Autowired
+	private Destination forward;
 
 	private volatile BlockingQueue<String> recovered = new LinkedBlockingQueue<String>();
 
@@ -66,7 +78,11 @@ public class BatchMessageListenerContainerIntegrationTests {
 	@Before
 	public void drainQueue() throws Exception {
 		container.stop();
+		jmsTemplate.setReceiveTimeout(JmsTemplate.RECEIVE_TIMEOUT_NO_WAIT);
 		while (jmsTemplate.receiveAndConvert("queue") != null) {
+			// do nothing
+		}
+		while (jmsTemplate.receiveAndConvert("forward") != null) {
 			// do nothing
 		}
 		processed.clear();
@@ -84,29 +100,82 @@ public class BatchMessageListenerContainerIntegrationTests {
 
 	@Test
 	public void testSendAndReceive() throws Exception {
+		final AtomicInteger redeliveries = new AtomicInteger();
 		container.setMessageListener(new MessageListener() {
 			@Override
 			public void onMessage(Message msg) {
 				try {
-					processed.add(((TextMessage) msg).getText());
+					try {
+						String text = ((TextMessage) msg).getText();
+						boolean redelivered = msg.getJMSRedelivered();
+						if (redelivered) {
+							redeliveries.incrementAndGet();
+						}
+						logger.info("Delivered:" + text + " redelivered:" + redelivered);
+						Thread.sleep(10);
+						jmsTemplate.convertAndSend(forward, msg);
+						processed.add(text);
+					}
+					catch (InterruptedException e) {
+						e.printStackTrace();
+					}
 				}
 				catch (JMSException e) {
 					throw new IllegalStateException(e);
 				}
 			}
 		});
-		container.initializeProxy();
-		container.start();
-		jmsTemplate.convertAndSend("queue", "foo");
-		jmsTemplate.convertAndSend("queue", "bar");
-		SortedSet<String> result = new TreeSet<String>();
-		for (int i = 0; i < 2; i++) {
-			result.add(processed.poll(5, TimeUnit.SECONDS));
+		jmsTemplate.setExplicitQosEnabled(true);
+		jmsTemplate.setDeliveryPersistent(true); // bug? this is supposed to be default
+		jmsTemplate.setSessionTransacted(false); // speed up sends
+		for (int i = 0; i < 1000; i++) {
+			try {
+				jmsTemplate.convertAndSend("queue", "foo" + i);
+				jmsTemplate.convertAndSend("queue", "bar" + i);
+			}
+			catch (Exception e) {
+				logger.info(e.getMessage());
+				Thread.sleep(1000);
+			}
 		}
-		assertEquals("[bar, foo]", result.toString());
+		jmsTemplate.setSessionTransacted(true);
+		container.start();
+		logger.info("sent");
+		jmsTemplate.setReceiveTimeout(10000);
+		SortedSet<String> result = new TreeSet<String>();
+		int forwards = 0;
+		int received = 0;
+		while(received < 2000) {
+			String poll = processed.poll(10, TimeUnit.SECONDS);
+			if (poll != null) {
+				result.add(poll);
+				logger.info("rcv:" + poll + " " + ++received);
+				try{
+		 			Object receive = jmsTemplate.receiveAndConvert(forward);
+		 			if (receive != null) {
+		 				logger.info("fwd:" + receive + " " + ++forwards);
+		 			}
+				}
+				catch (Exception e) {
+					System.out.println(e);
+				}
+			}
+		}
+		while(forwards < 2000) {
+			try{
+	 			Object receive = jmsTemplate.receiveAndConvert(forward);
+	 			if (receive != null) {
+	 				logger.info("fwd:" + receive + " " + ++forwards);
+	 			}
+			}
+			catch (Exception e) {
+				System.out.println(e);
+			}
+		}
+		logger.info("Done; redeliveries:" + redeliveries + ", received: " + received + ", forwarded:" + forwards);
 	}
 
-	@Test
+	@Test @Ignore
 	public void testFailureAndRepresent() throws Exception {
 		container.setMessageListener(new MessageListener() {
 			@Override
@@ -128,7 +197,7 @@ public class BatchMessageListenerContainerIntegrationTests {
 		}
 	}
 
-	@Test
+	@Test @Ignore
 	public void testFailureAndRecovery() throws Exception {
 		final RetryTemplate retryTemplate = new RetryTemplate();
 		retryTemplate.setRetryPolicy(new NeverRetryPolicy());
